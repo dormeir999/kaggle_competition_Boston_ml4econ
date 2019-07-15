@@ -1,0 +1,227 @@
+---
+title: "Boston Data ml4econ Kaggle Competition"
+date: "june 23 2019"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+<font size="3"> by _Dor Meir and Inbal Dekel_ </font>
+
+## Loading the data
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+install.packages("readr", repos = "http://cran.us.r-project.org")
+library(readr)
+
+train <- read_csv("data/train.csv")
+attach(train)
+test <- read_csv("data/test.csv")
+submissionExample <- read_csv("data/submissionExample.csv")
+```
+
+
+## Acquiring domain knowledge
+
+To acquire domain knowledge, we shall look at the documentation, structure and summary of the "Boston Housing Data", which the train and test datasets are based on.
+
+```{r, echo=TRUE}
+#install.packages("MASS", repos = "http://cran.us.r-project.org")
+library(MASS)
+#Boston?
+str(Boston)
+summary(Boston)
+```
+
+As can be seen, this dataset contains 506 observations and 14 variables.
+The response variable "medv" represents Boston area median house values and the predictors are a set of area specific features. 
+The only factor variable is "chas" and it's already coded as 0/1. There doesn't seem to be a justification for creating interaction terms with this variable.
+
+## Exploring and pre-processing the data
+
+First, let us check if there are any missing values in the train and test datasets.
+
+```{r, echo=TRUE}
+which(is.na(train))
+which(is.na(test))
+```
+
+As can be seen, there are no missing values. Now, let us create a scatter plot of every two variables (except "ID") in the train dataset.
+
+```{r, echo=TRUE}
+plot(train[-1])
+```
+
+As can be seen, some of the variables seems to have complex and non-linear relationships. Now let us scale the variables in the train dataset (that is, subtract their mean and divide by their standard error), and create a box plot of the scaled variables.
+
+```{r, echo=TRUE}
+train_scaled <- scale(train[-1])
+boxplot(train_scaled)
+```
+
+As can be seen, the medians of most scaled variables in the train dataset are close to zero. Moreover, the variables "crim", "zn", "rm" and "black" seem to have many outliers. 
+Now let us create a heat-map of the correlations between any two scaled variables (except "ID") in the train dataset.
+
+```{r, echo=TRUE}
+heatmap(cor(train_scaled))
+```
+
+As can be seen, the features with the largest variances are "dis", "zn", "rm", "black", "chas", "ptratio" and "crime". Yet whereas the response variable "medv" is highly correlated with the first five features, it is not correlated with "ptratio" and "crime". 
+This implies that PLS may be better than PCR in our context. This is because the underlying assumption in  PCR is that the directions in which the features vary the most are also linked to the dependent variable, and this doesn't seem to be the case here.
+That is,  PCR might overweight the variables "ptratio" and "crime" in the construction of the PCs. 
+
+## Choosing a model class:
+
+Let us go over the ML methods that we have studied in class to see which of them seems most appropriate for use in our setting.
+
+* Since the response variable (medv) is continuous, classification methods are irrelevant.
+* KNN is typically good for either one or two variables. Otherwise, the number of observations needs to grow exponentially. Since our train dataset consists of 13 features and only 333 observations, KNN doesn't seems to be appropriate in our setting.
+* Unsupervised learning doesn't seems to be appropriate in our setting since we do have a response variable (medv).
+
+Hence, it seems justifiable to use dimension reduction and tree-based methods. Specifically,
+
+**Dimention reduction methods:**
+
+* We will use Elastic Nets and find the optimal alpha (together with the optimal lambda) using Cross Validation. 
+* We will prefer PLS over PCR since it seems from the heat-map that the scaled variables "ptratio" and "crime" have high variances but that they are not correlated with the scaled response variable "medv". Thus PCR, which computes PCs in an unsupervised manner, might overweight these two variables.
+
+**Tree-based methods:**
+
+Since the scatter plot implies that there are complex and non-linear relationships between variables, it seems appropriate to use tree-based methods. Specifically, out of these methods, Random Forests seem best:
+
+* Random Forests seem better than a single decision tree since they combine a large number of trees and may thus reduce the variance and improve prediction accuracy. While combining a large number of trees causes a loss in interpretation, it doesn't matter to us as all we need in this task is to predict the response variable.
+* Random Forests seem better than Bagging since they decorrelate the trees, and may thus reduce the variance of the average of trees while keeping its bias the same. 
+* Random Forests may be better than Boosting since choosing a wrong number of iterations in Boosting might lead to over-fitting.
+
+Hence our chosen methods, that seem to be most appropriate in our setting, are: Elastic Nets, PLS and Random Forests.
+After we estimate these methods, we will create an ensemble (i.e., a weighted average) of the resulting predictions, where the weights will be estimated using Boosting.
+
+## Estimating the selected model classes and deriving predictions
+
+### Elastic Net:
+
+First, let us install and use glmnbetUtils to produce Elastic Net Cross-Validation for alpha and lambda simultaneously.
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+install.packages("glmnetUtils", repos = "http://cran.us.r-project.org") 
+library(glmnetUtils)
+elastic_net <- cva.glmnet(medv ~ . - ID, data = train) 
+```
+
+Note that the following defaults have been used:
+(1) A sequence of 11 values more closely spaced around 0 were used as alpha values for which to do Cross-Validation;
+(2) The number of Cross-Validation folds was 10;
+(3) All predictors were standardized prior to fitting the model.
+
+Now we shall find the best alpha and lambda that minimize the Cross-Validation MSE.
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+install.packages("data.table", repos = "http://cran.us.r-project.org") 
+library(data.table)
+
+num_alphas <- length(elastic_net$alpha)
+table <- data.table()
+
+for (i in 1:num_alphas){
+  alpha <- elastic_net$alpha[i] # A given alpha
+  min_lambda <- elastic_net$modlist[[i]]$lambda.min # Lambda that minimizes CV-MSE for the given alpha
+  min_mse <-  min(elastic_net$modlist[[i]]$cvm) # The minimum value of CV-MSE over lambdas for the given alpha
+  
+  new_row <- data.table(alpha, min_lambda, min_mse)
+  table <- rbind(table, new_row)
+}
+
+best_alpha_lambda <- table[which.min(table$min_mse)]
+colnames(best_alpha_lambda) <- c("Optimal alpha", "Optimal lambda", "CV-MSE")
+best_alpha  <- c(as.matrix(best_alpha_lambda[1,"Optimal alpha"]))
+best_lambda <- c(as.matrix(best_alpha_lambda[1,"Optimal lambda"]))
+```
+
+And the optimal alpha and lambda (together with the minimized CV-MSE) are:
+```{r, echo=TRUE}
+best_alpha_lambda
+```
+
+Using these optimal parameters, we can predict the response for the test and train datasets.
+
+```{r, echo=TRUE}
+predicted_test_elastic_net  <- predict(elastic_net, s = best_lambda, alpha = best_alpha, newdata = test[-1])
+predicted_train_elastic_net <- predict(elastic_net, s = best_lambda, alpha = best_alpha, newdata = train[-c(1,15)])
+```
+
+### PLS:
+
+First we shall find the number of PCs that minimizes the Cross-Validation MSE.
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+install.packages("pls", repos = "http://cran.us.r-project.org")
+library(pls)
+```
+
+```{r, echo=TRUE}
+pls <- plsr(medv ~ . - ID, data = train, scale = TRUE, validation = "CV")
+
+summary(pls)
+validationplot(pls)
+```
+
+Looking at the summary and plot, it is evident that the number of components that minimizes the RMSEP is 10.
+Yet if we look at the percentage of explained variance that each component adds (or the decrease in RMSEP due to the addition of any component), it seems that 5 components are enough. Hence we will use 5 components to predict the response for the test and train datasets.
+
+```{r, echo=TRUE}
+predicted_train_pls <- predict(pls, newdata = train, ncomp = 5) 
+predicted_test_pls  <- predict(pls, newdata = test, ncomp = 5)
+```
+
+### Random Forest:
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+install.packages("randomForest", repos = "http://cran.us.r-project.org")
+library(randomForest)
+```
+
+```{r, echo=TRUE}
+random_forest <- randomForest(medv ~ . - ID, data = train) 
+
+random_forest
+```
+
+We can now predict the response for the test and train datasets given our estimates.
+```{r, echo=TRUE}
+predicted_test_random_forest  <- predict(random_forest, newdata = test)
+predicted_train_random_forest <- predict(random_forest, newdata = train)
+```
+
+### Ensemble:
+
+Now we shall create an ensemble (i.e., a weighted average) of the derived predictions. To determine the weights, we will use Boosting and derive the relative importance of the predictors.
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+install.packages("gbm", repos = "https://CRAN.R-project.org")
+library(gbm)
+
+boosting <- gbm(train$medv ~ predicted_train_elastic_net + predicted_train_pls + predicted_train_random_forest - 1, distribution="gaussian")
+weights <- as.matrix(summary(boosting, plotit = FALSE)[2])
+weights <- weights / sum(weights)
+```
+
+The resulting weights are:
+
+```{r, echo=TRUE}
+weights
+```
+As can be seen, the Random Forest predictor receives most of the weight. Now we shall use these weights to create our ensemble prediction (over the test dataset).
+
+
+```{r, echo=TRUE}
+X <- cbind(predicted_test_elastic_net, predicted_test_pls, predicted_test_random_forest)
+ensemble <- X[,1] * weights[2] + X[,2] * weights[3] + X[,3] * weights[1]
+
+submission <- data.frame(test$ID, ensemble)
+colnames(submission) <- c("ID", "medv")
+write.csv(submission, file = "submission.csv",row.names=FALSE)
+```
